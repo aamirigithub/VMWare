@@ -1,0 +1,565 @@
+<#
+.SYNOPSIS
+    vSphere 7 to 8 Upgrade Assessment Script
+.DESCRIPTION
+    Comprehensive PowerCLI script to collect critical pre-upgrade information
+    for planning vSphere 7 to 8 upgrades. Exports organized CSV reports.
+.PARAMETER vCenterServers
+    Array of vCenter Server FQDNs or IP addresses to assess
+.PARAMETER OutputPath
+    Base path for output files (default: current directory)
+.PARAMETER Credential
+    PSCredential object for vCenter authentication
+.EXAMPLE
+    .\vSphere-Upgrade-Assessment.ps1 -vCenterServers "vcenter01.domain.com","vcenter02.domain.com"
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string[]]$vCenterServers,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = (Get-Location).Path,
+    
+    [Parameter(Mandatory=$false)]
+    [PSCredential]$Credential
+)
+
+# Import required modules
+try {
+    Import-Module VMware.PowerCLI -ErrorAction Stop
+    Write-Host "✓ VMware PowerCLI modules loaded successfully" -ForegroundColor Green
+} catch {
+    Write-Error "Failed to import VMware PowerCLI modules. Please install VMware PowerCLI first."
+    exit 1
+}
+
+# Disable certificate warnings for lab environments
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+Set-PowerCLIConfiguration -ParticipateInCEIP $false -Confirm:$false | Out-Null
+
+# Global variables
+$script:LogFile = ""
+$script:OutputFolder = ""
+$script:UpgradeBlockers = @()
+$script:Warnings = @()
+
+# Initialize logging and output folder
+function Initialize-Assessment {
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $script:OutputFolder = Join-Path $OutputPath "vSphere_Upgrade_Assessment_$timestamp"
+    New-Item -ItemType Directory -Path $script:OutputFolder -Force | Out-Null
+    
+    $script:LogFile = Join-Path $script:OutputFolder "assessment_log.txt"
+    
+    Write-Log "=== vSphere 7 to 8 Upgrade Assessment Started ===" -Level "INFO"
+    Write-Log "Output folder: $script:OutputFolder" -Level "INFO"
+    Write-Log "Target vCenter Servers: $($vCenterServers -join ', ')" -Level "INFO"
+}
+
+# Logging function
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR")]$Level = "INFO",
+        [switch]$Console
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    
+    Add-Content -Path $script:LogFile -Value $logEntry
+    
+    if ($Console -or $Level -ne "INFO") {
+        switch ($Level) {
+            "INFO"  { Write-Host $logEntry -ForegroundColor White }
+            "WARN"  { Write-Host $logEntry -ForegroundColor Yellow }
+            "ERROR" { Write-Host $logEntry -ForegroundColor Red }
+        }
+    }
+}
+
+# Progress tracking
+function Show-Progress {
+    param(
+        [string]$Activity,
+        [string]$Status,
+        [int]$PercentComplete,
+        [int]$Id = 1
+    )
+    
+    Write-Progress -Id $Id -Activity $Activity -Status $Status -PercentComplete $PercentComplete
+}
+
+# vCenter Server information collection
+function Get-vCenterInfo {
+    param([string]$vCenterServer)
+    
+    Write-Log "Collecting vCenter Server information for $vCenterServer" -Console
+    
+    try {
+        $vcInfo = Get-View -Id 'ServiceInstance' | ForEach-Object { Get-View $_.Content.About }
+        $ssoInfo = Get-SsoConfiguration -Server $vCenterServer -ErrorAction SilentlyContinue
+        
+        $vcData = [PSCustomObject]@{
+            vCenterServer = $vCenterServer
+            Name = $vcInfo.Name
+            Version = $vcInfo.Version
+            Build = $vcInfo.Build
+            InstanceUuid = $vcInfo.InstanceUuid
+            OSType = $vcInfo.OsType
+            ProductLineId = $vcInfo.ProductLineId
+            LicenseProductName = $vcInfo.LicenseProductName
+            LicenseProductVersion = $vcInfo.LicenseProductVersion
+            SSODomain = if ($ssoInfo) { $ssoInfo.Domain } else { "Unable to retrieve" }
+            ApiVersion = $vcInfo.ApiVersion
+            AssessmentTime = Get-Date
+        }
+        
+        # Check for upgrade blockers
+        if ([version]$vcInfo.Version -lt [version]"7.0") {
+            $script:UpgradeBlockers += "vCenter $vCenterServer is running version $($vcInfo.Version) - minimum version 7.0 required for upgrade to 8.0"
+        }
+        
+        return $vcData
+    } catch {
+        Write-Log "Error collecting vCenter info for ${vCenterServer}: $($_.Exception.Message)" -Level "ERROR"
+        return $null
+    }
+}
+
+# ESXi hosts information collection
+function Get-ESXiHostsInfo {
+    Write-Log "Collecting ESXi hosts information" -Console
+    
+    $hosts = Get-VMHost
+    $hostInfo = @()
+    $i = 0
+    
+    foreach ($vmhost in $hosts) {
+        $i++
+        Show-Progress -Activity "Collecting ESXi Host Information" -Status "Processing $($vmhost.Name)" -PercentComplete (($i / $hosts.Count) * 100)
+        
+        try {
+            $hostView = Get-View $vmhost
+            $hardware = $hostView.Hardware
+            $summary = $hostView.Summary
+            
+            $hostData = [PSCustomObject]@{
+                HostName = $vmhost.Name
+                Version = $vmhost.Version
+                Build = $vmhost.Build
+                ConnectionState = $vmhost.ConnectionState
+                PowerState = $vmhost.PowerState
+                Manufacturer = $hardware.SystemInfo.Vendor
+                Model = $hardware.SystemInfo.Model
+                ProcessorType = $summary.Hardware.CpuModel
+                NumCpuPackages = $summary.Hardware.NumCpuPkgs
+                NumCpuCores = $summary.Hardware.NumCpuCores
+                NumCpuThreads = $summary.Hardware.NumCpuThreads
+                CpuMhz = $summary.Hardware.CpuMhz
+                MemoryTotalGB = [math]::Round($summary.Hardware.MemorySize / 1GB, 2)
+                MemoryUsageGB = [math]::Round($summary.QuickStats.OverallMemoryUsage / 1024, 2)
+                Cluster = if ($vmhost.Parent) { $vmhost.Parent.Name } else { "Standalone" }
+                MaintenanceMode = $vmhost.State -eq "Maintenance"
+                HyperThreading = $summary.Config.HyperThread.Active
+                AssessmentTime = Get-Date
+            }
+            
+            # Check for upgrade compatibility
+            if ([version]$vmhost.Version -lt [version]"7.0") {
+                $script:UpgradeBlockers += "ESXi host $($vmhost.Name) is running version $($vmhost.Version) - minimum version 7.0 required"
+            }
+            
+            # Check hardware compatibility (simplified check)
+            $age = ((Get-Date).Year - 2015) # vSphere 8 generally supports hardware from 2015+
+            if ($hardware.SystemInfo.Vendor -match "Dell|HP|HPE|Cisco|Lenovo|Supermicro" -and $age -gt 8) {
+                $script:Warnings += "ESXi host $($vmhost.Name) hardware may need compatibility verification for vSphere 8"
+            }
+            
+            $hostInfo += $hostData
+        } catch {
+            Write-Log "Error collecting info for host $($vmhost.Name): $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    
+    Write-Progress -Id 1 -Activity "Collecting ESXi Host Information" -Completed
+    return $hostInfo
+}
+
+# Cluster information collection
+function Get-ClusterInfo {
+    Write-Log "Collecting cluster information" -Console
+    
+    $clusters = Get-Cluster
+    $clusterInfo = @()
+    
+    foreach ($cluster in $clusters) {
+        try {
+            $clusterData = [PSCustomObject]@{
+                ClusterName = $cluster.Name
+                DrsEnabled = $cluster.DrsEnabled
+                DrsAutomationLevel = $cluster.DrsAutomationLevel
+                HAEnabled = $cluster.HAEnabled
+                HAFailoverLevel = $cluster.HAFailoverLevel
+                HAAdmissionControlEnabled = $cluster.HAAdmissionControlEnabled
+                EVCMode = if ($cluster.EVCMode) { $cluster.EVCMode } else { "Disabled" }
+                VsanEnabled = $cluster.VsanEnabled
+                NumHosts = ($cluster | Get-VMHost).Count
+                NumVMs = ($cluster | Get-VM).Count
+                TotalCpuGHz = [math]::Round(($cluster | Get-VMHost | Measure-Object -Property CpuTotalMhz -Sum).Sum / 1000, 2)
+                TotalMemoryGB = [math]::Round(($cluster | Get-VMHost | Measure-Object -Property MemoryTotalGB -Sum).Sum, 2)
+                AssessmentTime = Get-Date
+            }
+            
+            $clusterInfo += $clusterData
+        } catch {
+            Write-Log "Error collecting cluster info for $($cluster.Name): $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    
+    return $clusterInfo
+}
+
+# Datastore information collection
+function Get-DatastoreInfo {
+    Write-Log "Collecting datastore information" -Console
+    
+    $datastores = Get-Datastore
+    $datastoreInfo = @()
+    $i = 0
+    
+    foreach ($ds in $datastores) {
+        $i++
+        Show-Progress -Activity "Collecting Datastore Information" -Status "Processing $($ds.Name)" -PercentComplete (($i / $datastores.Count) * 100)
+        
+        try {
+            $datastoreData = [PSCustomObject]@{
+                DatastoreName = $ds.Name
+                Type = $ds.Type
+                FileSystemVersion = $ds.FileSystemVersion
+                CapacityGB = [math]::Round($ds.CapacityGB, 2)
+                FreeSpaceGB = [math]::Round($ds.FreeSpaceGB, 2)
+                UsedSpacePercent = [math]::Round((($ds.CapacityGB - $ds.FreeSpaceGB) / $ds.CapacityGB) * 100, 2)
+                Accessible = $ds.Accessible
+                MultipleHostAccess = $ds.MultipleHostAccess
+                State = $ds.State
+                NumVMs = ($ds | Get-VM).Count
+                AssessmentTime = Get-Date
+            }
+            
+            # Check for potential issues
+            if ($datastoreData.UsedSpacePercent -gt 80) {
+                $script:Warnings += "Datastore $($ds.Name) is $($datastoreData.UsedSpacePercent)% full - consider cleanup before upgrade"
+            }
+            
+            if ($ds.Type -eq "VMFS" -and $ds.FileSystemVersion -lt "6") {
+                $script:Warnings += "Datastore $($ds.Name) is using VMFS version $($ds.FileSystemVersion) - consider upgrading to VMFS 6+"
+            }
+            
+            $datastoreInfo += $datastoreData
+        } catch {
+            Write-Log "Error collecting datastore info for $($ds.Name): $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    
+    Write-Progress -Id 1 -Activity "Collecting Datastore Information" -Completed
+    return $datastoreInfo
+}
+
+# Virtual machine information collection
+function Get-VMInfo {
+    Write-Log "Collecting virtual machine information" -Console
+    
+    $vms = Get-VM
+    $vmInfo = @()
+    $i = 0
+    
+    foreach ($vm in $vms) {
+        $i++
+        Show-Progress -Activity "Collecting VM Information" -Status "Processing $($vm.Name)" -PercentComplete (($i / $vms.Count) * 100)
+        
+        try {
+            $vmView = Get-View $vm
+            $config = $vmView.Config
+            $summary = $vmView.Summary
+            
+            # Get snapshots
+            $snapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
+            $oldSnapshots = $snapshots | Where-Object { $_.Created -lt (Get-Date).AddHours(-72) }
+            
+            # Get tools info
+            $toolsStatus = $vmView.Guest.ToolsStatus
+            $toolsVersion = $vmView.Config.Tools.ToolsVersion
+            
+            $vmData = [PSCustomObject]@{
+                VMName = $vm.Name
+                PowerState = $vm.PowerState
+                VMHost = $vm.VMHost.Name
+                Cluster = if ($vm.VMHost.Parent) { $vm.VMHost.Parent.Name } else { "Standalone" }
+                GuestOS = $config.GuestFullName
+                HardwareVersion = "vmx-$($config.Version.Substring(4))"
+                NumCpu = $config.Hardware.NumCPU
+                MemoryMB = $config.Hardware.MemoryMB
+                MemoryGB = [math]::Round($config.Hardware.MemoryMB / 1024, 2)
+                ProvisionedSpaceGB = [math]::Round($vm.ProvisionedSpaceGB, 2)
+                UsedSpaceGB = [math]::Round($vm.UsedSpaceGB, 2)
+                NumEthernetCards = ($config.Hardware.Device | Where-Object { $_ -is [VMware.Vim.VirtualEthernetCard] }).Count
+                NumDisks = ($config.Hardware.Device | Where-Object { $_ -is [VMware.Vim.VirtualDisk] }).Count
+                ToolsStatus = $toolsStatus
+                ToolsVersion = $toolsVersion
+                SnapshotCount = $snapshots.Count
+                OldSnapshotCount = $oldSnapshots.Count
+                CpuReservation = $config.CpuAllocation.Reservation
+                MemoryReservation = $config.MemoryAllocation.Reservation
+                AssessmentTime = Get-Date
+            }
+            
+            # Check for upgrade concerns
+            $hwVersionNum = [int]$config.Version.Substring(4)
+            if ($hwVersionNum -lt 14) {
+                $script:Warnings += "VM $($vm.Name) is using hardware version $hwVersionNum - consider upgrading before vSphere 8 migration"
+            }
+            
+            if ($toolsStatus -ne "toolsOk") {
+                $script:Warnings += "VM $($vm.Name) has VMware Tools status: $toolsStatus - update recommended"
+            }
+            
+            if ($oldSnapshots.Count -gt 0) {
+                $script:Warnings += "VM $($vm.Name) has $($oldSnapshots.Count) snapshots older than 72 hours - cleanup recommended"
+            }
+            
+            $vmInfo += $vmData
+        } catch {
+            Write-Log "Error collecting VM info for $($vm.Name): $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    
+    Write-Progress -Id 1 -Activity "Collecting VM Information" -Completed
+    return $vmInfo
+}
+
+# Network information collection
+function Get-NetworkInfo {
+    Write-Log "Collecting network information" -Console
+    
+    $networkInfo = @()
+    
+    # Standard vSwitches
+    $standardSwitches = Get-VirtualSwitch -Standard
+    foreach ($vss in $standardSwitches) {
+        $portGroups = Get-VirtualPortGroup -VirtualSwitch $vss
+        
+        foreach ($pg in $portGroups) {
+            $networkData = [PSCustomObject]@{
+                VMHost = $vss.VMHost.Name
+                SwitchName = $vss.Name
+                SwitchType = "Standard"
+                PortGroupName = $pg.Name
+                VLanId = $pg.VLanId
+                ActiveNics = ($vss.Nic -join ", ")
+                NumPorts = $vss.NumPorts
+                NumPortsAvailable = $vss.NumPortsAvailable
+                Mtu = $vss.Mtu
+                AssessmentTime = Get-Date
+            }
+            $networkInfo += $networkData
+        }
+    }
+    
+    # Distributed vSwitches
+    $distributedSwitches = Get-VDSwitch
+    foreach ($vds in $distributedSwitches) {
+        $portGroups = Get-VDPortgroup -VDSwitch $vds
+        
+        foreach ($pg in $portGroups) {
+            $networkData = [PSCustomObject]@{
+                VMHost = "Multiple (Distributed)"
+                SwitchName = $vds.Name
+                SwitchType = "Distributed"
+                PortGroupName = $pg.Name
+                VLanId = if ($pg.VlanConfiguration) { $pg.VlanConfiguration } else { "N/A" }
+                ActiveNics = "Distributed"
+                NumPorts = $vds.NumUplinkPorts
+                NumPortsAvailable = "N/A"
+                Mtu = $vds.Mtu
+                Version = $vds.Version
+                AssessmentTime = Get-Date
+            }
+            $networkInfo += $networkData
+        }
+    }
+    
+    return $networkInfo
+}
+
+# Export data to CSV
+function Export-AssessmentData {
+    param(
+        [PSCustomObject[]]$Data,
+        [string]$FileName,
+        [string]$Description
+    )
+    
+    if ($Data -and $Data.Count -gt 0) {
+        $csvPath = Join-Path $script:OutputFolder "$FileName.csv"
+        $Data | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+        Write-Log "Exported $($Data.Count) $Description records to $csvPath" -Console
+    } else {
+        Write-Log "No $Description data to export" -Level "WARN"
+    }
+}
+
+# Generate summary report
+function New-SummaryReport {
+    $summaryPath = Join-Path $script:OutputFolder "upgrade_assessment_summary.txt"
+    
+    $summary = @"
+===================================================================
+vSphere 7 to 8 Upgrade Assessment Summary
+Generated: $(Get-Date)
+===================================================================
+
+UPGRADE BLOCKERS:
+$($script:UpgradeBlockers.Count) critical issues found that must be resolved before upgrade.
+
+$(if ($script:UpgradeBlockers.Count -gt 0) {
+    $script:UpgradeBlockers | ForEach-Object { "  • $_" }
+} else {
+    "  • No critical upgrade blockers identified."
+})
+
+WARNINGS AND RECOMMENDATIONS:
+$($script:Warnings.Count) items need attention for optimal upgrade experience.
+
+$(if ($script:Warnings.Count -gt 0) {
+    $script:Warnings | ForEach-Object { "  • $_" }
+} else {
+    "  • No warnings identified."
+})
+
+NEXT STEPS:
+1. Review all exported CSV files for detailed inventory
+2. Address any upgrade blockers before proceeding
+3. Plan for warning items during maintenance windows
+4. Verify hardware compatibility with VMware HCL
+5. Review vSphere 8 compatibility guide
+6. Plan upgrade sequence (vCenter first, then ESXi hosts)
+
+FILES GENERATED:
+$(Get-ChildItem $script:OutputFolder -Filter "*.csv" | ForEach-Object { "  • $($_.Name)" })
+
+For detailed information, review the individual CSV files and assessment log.
+===================================================================
+"@
+
+    Set-Content -Path $summaryPath -Value $summary -Encoding UTF8
+    Write-Log "Summary report generated: $summaryPath" -Console
+}
+
+# Main execution function
+function Start-vSphereAssessment {
+    Initialize-Assessment
+    
+    $allvCenterInfo = @()
+    $allHostInfo = @()
+    $allClusterInfo = @()
+    $allDatastoreInfo = @()
+    $allVMInfo = @()
+    $allNetworkInfo = @()
+    
+    foreach ($vCenter in $vCenterServers) {
+        Write-Log "=== Processing vCenter Server: $vCenter ===" -Console
+        
+        try {
+            # Get credentials if not provided
+            if (-not $Credential) {
+                $Credential = Get-Credential -Message "Enter credentials for vCenter Server $vCenter"
+            }
+            
+            # Connect to vCenter
+            Write-Log "Connecting to vCenter Server $vCenter" -Console
+            $connection = Connect-VIServer -Server $vCenter -Credential $Credential -ErrorAction Stop
+            Write-Log "Successfully connected to $vCenter" -Console
+            
+            # Collect data
+            Show-Progress -Activity "vSphere Assessment" -Status "Collecting vCenter Information" -PercentComplete 10
+            $vcInfo = Get-vCenterInfo -vCenterServer $vCenter
+            if ($vcInfo) { $allvCenterInfo += $vcInfo }
+            
+            Show-Progress -Activity "vSphere Assessment" -Status "Collecting ESXi Host Information" -PercentComplete 25
+            $hostInfo = Get-ESXiHostsInfo
+            if ($hostInfo) { $allHostInfo += $hostInfo }
+            
+            Show-Progress -Activity "vSphere Assessment" -Status "Collecting Cluster Information" -PercentComplete 40
+            $clusterInfo = Get-ClusterInfo
+            if ($clusterInfo) { $allClusterInfo += $clusterInfo }
+            
+            Show-Progress -Activity "vSphere Assessment" -Status "Collecting Datastore Information" -PercentComplete 55
+            $datastoreInfo = Get-DatastoreInfo
+            if ($datastoreInfo) { $allDatastoreInfo += $datastoreInfo }
+            
+            Show-Progress -Activity "vSphere Assessment" -Status "Collecting Virtual Machine Information" -PercentComplete 75
+            $vmInfo = Get-VMInfo
+            if ($vmInfo) { $allVMInfo += $vmInfo }
+            
+            Show-Progress -Activity "vSphere Assessment" -Status "Collecting Network Information" -PercentComplete 90
+            $networkInfo = Get-NetworkInfo
+            if ($networkInfo) { $allNetworkInfo += $networkInfo }
+            
+            # Disconnect from vCenter
+            Disconnect-VIServer -Server $vCenter -Confirm:$false
+            Write-Log "Disconnected from $vCenter" -Console
+            
+        } catch {
+            Write-Log "Error processing vCenter $vCenter : $($_.Exception.Message)" -Level "ERROR"
+            if ($connection) {
+                Disconnect-VIServer -Server $vCenter -Confirm:$false -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    
+    # Export all collected data
+    Show-Progress -Activity "vSphere Assessment" -Status "Exporting Results" -PercentComplete 95
+    Export-AssessmentData -Data $allvCenterInfo -FileName "01_vCenter_Servers" -Description "vCenter Server"
+    Export-AssessmentData -Data $allHostInfo -FileName "02_ESXi_Hosts" -Description "ESXi Host"
+    Export-AssessmentData -Data $allClusterInfo -FileName "03_Clusters" -Description "Cluster"
+    Export-AssessmentData -Data $allDatastoreInfo -FileName "04_Datastores" -Description "Datastore"
+    Export-AssessmentData -Data $allVMInfo -FileName "05_Virtual_Machines" -Description "Virtual Machine"
+    Export-AssessmentData -Data $allNetworkInfo -FileName "06_Network_Configuration" -Description "Network"
+    
+    # Generate summary report
+    New-SummaryReport
+    
+    Write-Progress -Activity "vSphere Assessment" -Status "Complete" -PercentComplete 100
+    Start-Sleep -Seconds 1
+    Write-Progress -Activity "vSphere Assessment" -Completed
+    
+    Write-Log "=== vSphere Assessment Completed ===" -Console
+    Write-Log "Results saved to: $script:OutputFolder" -Console
+    
+    if ($script:UpgradeBlockers.Count -gt 0) {
+        Write-Log "$($script:UpgradeBlockers.Count) CRITICAL upgrade blockers found! Review summary report." -Level "ERROR"
+    }
+    
+    if ($script:Warnings.Count -gt 0) {
+        Write-Log "$($script:Warnings.Count) warnings identified. Review for optimization opportunities." -Level "WARN"
+    }
+}
+
+# Script execution
+try {
+    Start-vSphereAssessment
+} catch {
+    Write-Log "Script execution failed: $($_.Exception.Message)" -Level "ERROR"
+    exit 1
+} finally {
+    # Cleanup any remaining connections
+    if (Get-VIServer -ErrorAction SilentlyContinue) {
+        Disconnect-VIServer -Server * -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`n✓ Assessment complete! Check the output folder for detailed results." -ForegroundColor Green
+Write-Host "Output location: $script:OutputFolder" -ForegroundColor Cyan
