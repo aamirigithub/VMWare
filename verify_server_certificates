@@ -1,0 +1,19 @@
+# Replace with your vCenter FQDN or IP
+$hostname = "<vcenter_fqdn_or_ip>"
+$port = 443
+
+$tcpClient = New-Object Net.Sockets.TcpClient($hostname, $port)
+$sslStream = New-Object Net.Security.SslStream($tcpClient.GetStream(), $false, ({ $true }))
+$sslStream.AuthenticateAsClient($hostname)
+
+$cert = $sslStream.RemoteCertificate
+$cert2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $cert
+
+Write-Host "Subject: $($cert2.Subject)"
+Write-Host "Issuer: $($cert2.Issuer)"
+Write-Host "Effective Date: $($cert2.NotBefore)"
+Write-Host "Expiry Date: $($cert2.NotAfter)"
+Write-Host "Expired: $($cert2.NotAfter -lt (Get-Date))"
+
+$sslStream.Close()
+$tcpClient.Close()
